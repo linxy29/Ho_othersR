@@ -29,6 +29,11 @@ library(Seurat)
 library(tidyverse)
 ```
 
+```{r}
+memory.limit(80000)
+options(future.globals.maxSize = 80000 * 1024^2) # 80G memory
+```
+
 ## 30 clusters with even sizes
 
 ```{r}
@@ -69,7 +74,7 @@ DimPlot(seuratObj, reduction = "umap")
 ### save as h5ad
 
 ```{r}
-zellkonverter::writeH5AD(sim, "/storage/holab/linxy/others/flowgrid_sim1.h5ad")
+zellkonverter::writeH5AD(sim, "D:/Data/others/flowgrid_sim1.h5ad")
 ```
 
 
