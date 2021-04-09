@@ -356,6 +356,14 @@ pre code {
 
 
 <p>Generate large scRNA-seq data for FlowGrid.</p>
+<p>The overall sample size should be around 500k</p>
+<p>Three types of data:</p>
+<ul>
+<li><p>cell clusters with the same size</p></li>
+<li><p>20 big clusters and 10 small clusters</p></li>
+<li><p>10 big clusters, 10 medium clusters and 10 small clusters(0.1%-0.5%)</p></li>
+</ul>
+<p>The cluster size is defined based on <a href="https://pubmed.ncbi.nlm.nih.gov/29622724/">Park’s paper, 2018</a></p>
 <pre class="r"><code>knitr::opts_chunk$set(echo = FALSE)
 library(splatter)
 library(Seurat)
