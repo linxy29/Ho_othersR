@@ -1,0 +1,35 @@
+---
+title: "FlowGrid"
+author: "Xinyi Lin"
+date: "4/9/2021"
+output: html_document
+---
+
+Generate large scRNA-seq data for FlowGrid.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r,message=FALSE,warning=FALSE}
+library(splatter)
+library(Seurat)
+library(tidyverse)
+```
+
+```{r}
+## simulate cells pool setting
+set.seed(123)
+cluster_num = 8
+prob = rep(1/cluster_num, cluster_num)
+batch_size = cluster_num * 1500
+de_prob = rep(NA, cluster_num)
+de_prob[1:round(cluster_num/2)] = runif(round(cluster_num/2), 0.1, 0.2)
+de_prob[(round(cluster_num/2)+1):cluster_num] = runif((cluster_num - round(cluster_num/2)), 0.5, 1)
+setresolu = 0.5
+```
+
+
+```{r, ref.label=knitr::all_labels(),echo=TRUE,eval=FALSE}
+```
+
