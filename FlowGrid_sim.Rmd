@@ -43,7 +43,7 @@ options(future.globals.maxSize = 80000 * 1024^2) # 80G memory
 cluster_num = 30
 prob = rep(1/cluster_num, cluster_num)
 batch_size = 200000
-de_prob = rep(0.3, cluster_num)
+de_prob = rep(0.2, cluster_num)
 setresolu = 0.5
 ```
 
@@ -53,16 +53,19 @@ set.seed(123)
 #params = readRDS("./data/mnnCT7params.rds")
 params <- newSplatParams()
 sim <- splatSimulate(params, batchCells = round(batch_size*prob), group.prob = prob, de.prob = de_prob)
-#sim <- splatSimulate(batchCells = round(batch_size*prob), group.prob = prob, method = "groups", verbose = FALSE)
-sim_mat <- counts(sim)
-origLabels = sim@colData@listData$Group
+zellkonverter::writeH5AD(sim, "D:/Data/others/flowgrid_sim1.h5ad")
+
+## send email after finishing
+sendEmail('Simulation is done!!')
 ```
 
 ### plot the UMAP of clusters
 
 ```{r}
-sim_mat = sim_mat[,sample(1:dim(sim_mat)[2], 0.01*dim(sim_mat)[2])]
-seuratObj <- CreateSeuratObject(counts = sim_mat, project="Splatter")
+sim_mat <- counts(sim)
+origLabels = sim@colData@listData$Group
+sim_mat_sub = sim_mat[,sample(1:dim(sim_mat)[2], 0.01*dim(sim_mat)[2])]
+seuratObj <- CreateSeuratObject(counts = sim_mat_sub, project="Splatter")
 seuratObj <- NormalizeData(seuratObj, verbose = FALSE)
 seuratObj <- FindVariableFeatures(seuratObj, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
 seuratObj <- ScaleData(seuratObj)
@@ -86,7 +89,7 @@ Do not have enough memory to simulate it at once, try to simulate three times an
 ```{r}
 cluster_num = 30/3
 prob = rep(1/cluster_num, cluster_num)
-batch_size = 500000/3
+batch_size = 200000/3
 de_prob = rep(0.5, cluster_num)
 setresolu = 0.5
 ```
@@ -108,11 +111,11 @@ for (idx in 2:3){
 rm(sim)
 rm(mat_sub)
 sim_seurat = CreateSeuratObject(counts = sim_mat, project="Splatter")
-sim_seurat[['truth.label']] = origLabels
+sim_seurat[['truth']] = origLabels
 SaveH5Seurat(sim_seurat, filename = "D:/Data/others/flowgrid_sim1.h5Seurat")
 Convert("D:/Data/others/flowgrid_sim1.h5Seurat", dest = "h5ad")
 ```
-
+##
 ```{r, ref.label=knitr::all_labels(),echo=TRUE,eval=FALSE}
 ```
 
