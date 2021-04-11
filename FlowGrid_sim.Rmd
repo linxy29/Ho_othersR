@@ -27,6 +27,8 @@ knitr::opts_chunk$set(echo = FALSE)
 library(splatter)
 library(Seurat)
 library(tidyverse)
+library(SeuratDisk)
+library(SeuratWrappers)
 ```
 
 ```{r}
@@ -40,7 +42,7 @@ options(future.globals.maxSize = 80000 * 1024^2) # 80G memory
 ## simulate cells pool setting
 cluster_num = 30
 prob = rep(1/cluster_num, cluster_num)
-batch_size = 500000
+batch_size = 200000
 de_prob = rep(0.3, cluster_num)
 setresolu = 0.5
 ```
@@ -77,6 +79,39 @@ DimPlot(seuratObj, reduction = "umap")
 zellkonverter::writeH5AD(sim, "D:/Data/others/flowgrid_sim1.h5ad")
 ```
 
+### Simulate three times
+
+Do not have enough memory to simulate it at once, try to simulate three times and combine.
+
+```{r}
+cluster_num = 30/3
+prob = rep(1/cluster_num, cluster_num)
+batch_size = 500000/3
+de_prob = rep(0.5, cluster_num)
+setresolu = 0.5
+```
+
+```{r}
+params <- newSplatParams()
+sim <- splatSimulate(params, batchCells = round(batch_size*prob), group.prob = prob, de.prob = de_prob, seed = 1, verbose = FALSE)
+sim_mat = counts(sim) %>% Matrix::Matrix(sparse = TRUE)
+origLabels = sim@colData@listData$Batch
+for (idx in 2:3){
+  sim <- splatSimulate(params, batchCells = round(batch_size*prob), group.prob = prob, de.prob = de_prob, seed = idx, verbose = FALSE)
+  mat_sub = counts(sim) %>% Matrix::Matrix(sparse = TRUE)
+  sim_mat = cbind(sim_mat, mat_sub)
+  origLabels = c(origLabels, sim@colData@listData$Batch)
+}
+```
+
+```{r}
+rm(sim)
+rm(mat_sub)
+sim_seurat = CreateSeuratObject(counts = sim_mat, project="Splatter")
+sim_seurat[['truth.label']] = origLabels
+SaveH5Seurat(sim_seurat, filename = "D:/Data/others/flowgrid_sim1.h5Seurat")
+Convert("D:/Data/others/flowgrid_sim1.h5Seurat", dest = "h5ad")
+```
 
 ```{r, ref.label=knitr::all_labels(),echo=TRUE,eval=FALSE}
 ```
