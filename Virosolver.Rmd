@@ -1,0 +1,675 @@
+---
+title: "Try Virosolver"
+author: "Xinyi Lin"
+date: "7/26/2021"
+output: html_document
+---
+
+Code is based on https://github.com/jameshay218/virosolver.
+
+## load package
+
+```{r}
+#devtools::load_all("C:/#Code/R/lazymcmc")
+
+library(virosolver)
+library(tidyverse)
+library(patchwork)
+library(lazymcmc)
+library(foreach)
+library(doParallel)
+
+cl <- parallel::makeCluster(4, setup_strategy = "sequential")
+registerDoParallel(cl)
+```
+
+## load data
+
+```{r}
+data(example_ct_data)
+head(example_ct_data)
+example_ct_data$t %>% as.factor() %>% summary()
+```
+
+Our own data
+
+```{r}
+library(readxl)
+ct_value <- read_excel("D:/Data/others/CXR/Radge Master 22-4-2021-2.xlsx", 
+    sheet = "Ct_used") %>% 
+  janitor::clean_names() %>% 
+  select(-contains("_bu")) %>% 
+  mutate(t = as.Date(test_1)) %>% 
+  select(-test_1, -result_1) %>% 
+  mutate(t = t - min(t) + 10)
+```
+
+check the distribution of ct and time
+
+```{r}
+plot(ct_value$ct)  ## one outlier, filter it
+plot(ct_value$t)
+ct_used = ct_value %>% filter(ct < 100)
+```
+
+## not sure what is happening here
+
+```{r}
+data(example_gp_partab)
+head(example_gp_partab)
+pars <- example_gp_partab$values
+names(pars) <- example_gp_partab$names
+
+## Solve the Ct model over a range of times since infection (referred to as "ages")
+test_ages <- seq(1,50,by=1)
+
+## This gives the modal Ct value
+cts <- viral_load_func(pars, test_ages)
+
+p_ct_model <- ggplot(data.frame(ct=c(40,cts),t=c(0,test_ages))) + 
+  geom_line(aes(x=t,y=ct)) + 
+  scale_y_continuous(trans="reverse",
+                     limits=c(40,10)) +
+  theme_bw() +
+  ylab("Modal Ct value") +
+  xlab("Days since infection")
+
+## Note that this model does not solve for t=0, 
+## as it is always assumed that no one is detectable 0 days post infection
+prop_detect <- prop_detectable(test_ages,pars, cts)
+p_ct_model_detectable <- ggplot(data.frame(p=c(0,prop_detect),t=c(0,test_ages))) + 
+  geom_line(aes(x=t,y=p)) + 
+  theme_bw() +
+  ylab("Proportion of infections\n still detectable") +
+  xlab("Days since infection")
+p_ct_model/p_ct_model_detectable
+```
+
+## simulate data
+
+```{r}
+sim_cts <- simulate_viral_loads_example(test_ages, pars,N=200)
+head(sim_cts)
+```
+
+## inference
+
+```{r}
+data(example_gp_partab)
+head(example_gp_partab)
+example_gp_partab <- example_gp_partab %>% filter(names == "viral_peak") %>% mutate(fixed=0)
+example_gp_partab <- example_gp_partab %>% filter(names == "intercept") %>% mutate(fixed=1)
+```
+
+## Estimating incidence from multiple cross sections
+
+```{r}
+## MCMC chain options
+mcmc_pars <- c("iterations"=500000,"popt"=0.44,"opt_freq"=2000,
+                    "thin"=2500,"adaptive_period"=200000,"save_block"=100)
+
+## Set pointer to the Gaussian Process model as the incidence function
+incidence_function <- gaussian_process_model
+## Read in the GP model parameter control table
+data(example_gp_partab)
+
+## This is for the GP version
+times <- 0:max(ct_used$t)
+mat <- matrix(rep(times, each=length(times)),ncol=length(times))
+t_dist <- abs(apply(mat, 2, function(x) x-times))
+par_tab <- example_gp_partab
+par_tab <- bind_rows(par_tab[par_tab$names != "prob",], par_tab[par_tab$names == "prob",][1:length(times),])
+pars <- par_tab$values
+names(pars) <- par_tab$names
+
+## Pull out the current values for each parameter, and set these as the prior means
+means <- par_tab$values
+names(means) <- par_tab$names
+
+## Set standard deviations of prior distribution
+sds_gp <- c("obs_sd"=0.5,"viral_peak"=2,
+         "wane_rate2"=1,"t_switch"=3,"level_switch"=1,
+         "prob_detect"=0.03,
+         "incubation"=0.25, "infectious"=0.5)
+
+## Define a function that returns the log prior probability for a given vector of parameter
+## values in `pars`, given the prior means and standard deviations set above.
+## Prior for GP version
+prior_func_gp <- function(pars, ...){
+  par_names <- names(pars)
+  
+  ## Viral kinetics parameters
+  obs_sd_prior <- dnorm(pars["obs_sd"], means[which(names(means) == "obs_sd")], sds_gp["obs_sd"],log=TRUE)
+  viral_peak_prior <- dnorm(pars["viral_peak"], means[which(names(means) == "viral_peak")], sds_gp["viral_peak"],log=TRUE)
+  wane_2_prior <- dnorm(pars["wane_rate2"],means[which(names(means) == "wane_rate2")],sds_gp["wane_rate2"],log=TRUE)
+  tswitch_prior <- dnorm(pars["t_switch"],means[which(names(means) == "t_switch")],sds_gp["t_switch"],log=TRUE)
+  level_prior <- dnorm(pars["level_switch"],means[which(names(means) == "level_switch")],sds_gp["level_switch"],log=TRUE)
+  beta1_mean <- means[which(names(means) == "prob_detect")]
+  beta1_sd <- sds_gp["prob_detect"]
+  beta_alpha <- ((1-beta1_mean)/beta1_sd^2 - 1/beta1_mean)*beta1_mean^2
+  beta_beta <- beta_alpha*(1/beta1_mean - 1)
+  beta_prior <- dbeta(pars["prob_detect"],beta_alpha,beta_beta,log=TRUE)
+  
+  ### VERY IMPORTANT
+  ## Gaussian process prior, un-centered version
+  k <- pars[which(par_names=="prob")]
+  ## Leave this - correct for uncentered version as per Chapter 14 Statistical Rethinking
+  prob_priors <- sum(dnorm(k, 0, 1, log=TRUE))
+  #########
+  
+  nu_prior <- dexp(pars["nu"], 1/means[which(names(means) == "nu")],log=TRUE)
+  rho_prior <- dexp(pars["rho"], 1/means[which(names(means) == "rho")],log=TRUE)
+  
+  obs_sd_prior + viral_peak_prior + wane_2_prior + tswitch_prior +
+    level_prior + beta_prior + prob_priors +
+    nu_prior + rho_prior
+}
+```
+
+Change some prior values to fit our data
+
+```{r}
+par_tab[par_tab$names == "intercept",]$values = 10
+par_tab[par_tab$names == "intercept",]$lower_bound = 5
+par_tab[par_tab$names == "intercept",]$upper_bound = 50
+```
+
+
+```{r}
+create_posterior_func = function (parTab, data, PRIOR_FUNC = NULL, INCIDENCE_FUNC = NULL, 
+    solve_ver = "likelihood", solve_likelihood = TRUE, 
+    use_pos = FALSE, ...) 
+{
+    par_names <- parTab$names
+    pars <- parTab$values
+    names(pars) <- par_names
+    times <- 0:max(data$t)
+    ages <- 1:max(data$t)
+    obs_times <- unique(data$t)
+    data_use <- data
+    undetectable_counts <- NULL
+    if ("intercept" %in% par_names) {
+        undetectable_tally <- data_use %>% filter(ct >= pars["intercept"]) %>% 
+            group_by(t) %>% tally()
+        no_undetectable_times <- setdiff(obs_times, unique(undetectable_tally$t))
+        no_undetectable_tally <- tibble(t = no_undetectable_times, 
+            n = 0)
+        if (nrow(no_undetectable_tally) != 0)
+          undetectable_tally <- bind_rows(undetectable_tally, no_undetectable_tally) %>% 
+            arrange(t)
+        undetectable_counts <- undetectable_tally$n
+        data_use <- data_use %>% filter(ct < pars["intercept"])
+    }
+    data_list <- NULL
+    for (i in seq_along(obs_times)) {
+        data_list[[i]] <- data_use %>% filter(t == obs_times[i]) %>% 
+            pull(ct)
+    }
+    f <- function(pars) {
+        names(pars) <- par_names
+        prob_infection_tmp <- INCIDENCE_FUNC(pars, times)
+        if (solve_ver == "likelihood") {
+            lik <- 0
+            if (solve_likelihood) {
+                lik <- sum(likelihood_cpp_wrapper(data_list, 
+                  ages, obs_times, pars, prob_infection_tmp, 
+                  use_pos, undetectable_counts))
+            }
+            if (!is.null(PRIOR_FUNC)) {
+                prior <- PRIOR_FUNC(pars, ...)
+                lik <- lik + prior
+            }
+            return(lik)
+        }
+        else {
+            preds <- pred_dist_wrapper(seq(0, 40, by = 1), obs_times, 
+                ages, pars, prob_infection_tmp)
+            return(preds)
+        }
+    }
+    f
+}
+```
+
+
+```{r}
+## Check that posterior function solves and returns a finite likelihood
+posterior_function <- create_posterior_func(parTab=par_tab, 
+                                            data=ct_used, 
+                                            PRIOR_FUNC=prior_func_gp, 
+                                            INCIDENCE_FUNC=incidence_function,
+                                            t_dist=t_dist)
+posterior_function(par_tab$values)
+##    obs_sd 
+## -30983.29
+```
+
+```{r}
+run_MCMC <- function(parTab,
+                     data=NULL,
+                     mcmcPars,
+                     filename,
+                     CREATE_POSTERIOR_FUNC=NULL,
+                     mvrPars=NULL,
+                     PRIOR_FUNC=NULL,
+                     OPT_TUNING=0.2,
+                     ...){
+    ## check that input parameters are correctly formatted
+    parTab_check <- lazymcmc::param_table_check(parTab)
+    if(parTab_check[[1]] == TRUE) return(parTab_check[[2]])
+    mcmcPar_check <- lazymcmc::mcmc_param_check(mcmcPars, mvrPars)
+    if(mcmcPar_check[[1]] == TRUE) return(mcmcPar_check[[2]])
+
+    ## Allowable error in scale tuning
+    TUNING_ERROR <- 0.1
+
+    ## Extract MCMC parameters
+    iterations <- mcmcPars["iterations"]
+    popt <- mcmcPars["popt"]
+    opt_freq<- mcmcPars["opt_freq"]
+    thin <- mcmcPars["thin"]
+    adaptive_period<- mcmcPars["adaptive_period"]
+    save_block <- mcmcPars["save_block"]
+
+    param_length <- nrow(parTab)
+    unfixed_pars <- which(parTab$fixed == 0)
+    unfixed_par_length <- nrow(parTab[parTab$fixed== 0,])
+    current_pars <- parTab$values
+    par_names <- as.character(parTab$names)
+
+    ## Parameter constraints
+    lower_bounds <- parTab$lower_bound
+    upper_bounds <- parTab$upper_bound
+    steps <- parTab$steps
+    fixed <- parTab$fixed
+
+    ## Arrays to store acceptance rates
+    ## If univariate proposals
+    if(is.null(mvrPars)){
+        tempaccepted <- tempiter <- integer(param_length)
+        reset <- integer(param_length)
+        reset[] <- 0
+    } else { # If multivariate proposals
+        tempaccepted <- tempiter <- 0
+        covMat <- mvrPars[[1]][unfixed_pars,unfixed_pars]
+        scale <- mvrPars[[2]]
+        w <- mvrPars[[3]]
+        if(length(mvrPars) > 3){
+          scale_freq <- mvrPars[[4]]
+        } else {
+          scale_freq <- 0.8
+        }
+    }
+
+    posterior_simp <- protect(CREATE_POSTERIOR_FUNC(parTab=parTab,data=data,
+                                                    PRIOR_FUNC=PRIOR_FUNC,...))
+
+    ## Setup MCMC chain file with correct column names
+    mcmc_chain_file <- paste(filename,"_univariate_chain.csv",sep="")
+    if(!is.null(mvrPars)) mcmc_chain_file <- paste(filename,"_multivariate_chain.csv",sep="")
+
+    ## Create empty chain to store every iteration for the adaptive period
+    opt_chain <- matrix(nrow=adaptive_period,ncol=unfixed_par_length)
+    chain_index <- 1
+
+    ## Initial conditions ------------------------------------------------------
+    ## Initial likelihood
+    posterior.out <- posterior_simp(current_pars)
+    ## added feature by ada-w-yan: for each recorded iteration,
+    ## we can now write a vector with miscellaneous output to file in addition
+    ## to the parameter values and likelihood
+    ## (for example, predicted model output)
+    ## usage: posterior_simp(proposal) should either return
+    ## the likelihood as a numeric vector of length 1,
+    ## or a list with elements
+    ## list$lik: the likelihood as a numeric vector of length 1
+    ## list$misc: any additional output as a vector
+    ## the length of list$misc has to be the same for all proposal values
+    if(is.atomic(posterior.out)){
+      probab <- posterior.out
+      misc <- numeric()
+    } else {
+      probab <- posterior.out$lik
+      misc <- unname(posterior.out$misc)
+    }
+    misc_length <- length(misc)
+
+    ## Create empty chain to store "save_block" iterations at a time
+    save_chain <- empty_save_chain <- matrix(nrow=save_block,ncol=param_length+2+misc_length)
+
+    ## Set up initial csv file
+    if(is.atomic(posterior.out) || is.null(names(posterior.out$misc))){
+      misc_colnames <- rep("misc",misc_length)
+      if(misc_length > 0){
+        misc_colnames <- paste0(misc_colnames,1:misc_length)
+      }
+    } else {
+      misc_colnames <- names(posterior.out$misc)
+    }
+    chain_colnames <- c("sampno",par_names,misc_colnames,"lnlike")
+    tmp_table <- array(dim=c(1,length(chain_colnames)))
+    tmp_table <- as.data.frame(tmp_table)
+    tmp_table[1,] <- c(1,current_pars,misc,probab)
+
+    colnames(tmp_table) <- chain_colnames
+
+    ## Write starting conditions to file
+    write.table(tmp_table,file=mcmc_chain_file,row.names=FALSE,col.names=TRUE,sep=",",append=FALSE)
+
+    ## Initial indexing parameters
+    no_recorded <- 1
+    sampno <- 2
+    par_i <- 1
+    for (i in 1:(iterations+adaptive_period)){
+        ## If using univariate proposals
+        if(is.null(mvrPars)) {
+            ## For each parameter (Gibbs)
+            j <- unfixed_pars[par_i]
+            par_i <- par_i + 1
+            if(par_i > unfixed_par_length) par_i <- 1
+            #if(univ_proposal_ver == 1){
+            #  proposal <- univ_proposal(current_pars, lower_bounds, upper_bounds, steps,j)
+            #} else {
+              proposal <- univ_proposal_normal(current_pars, steps,j)
+            #}
+            tempiter[j] <- tempiter[j] + 1
+            ## If using multivariate proposals
+        } else {
+            proposal <- mvr_proposal(current_pars, unfixed_pars, scale*covMat)
+            tempiter <- tempiter + 1
+        }
+        ## Propose new parameters and calculate posterior
+        ## Check that all proposed parameters are in allowable range
+        if(!any(
+                proposal[unfixed_pars] < lower_bounds[unfixed_pars] |
+                proposal[unfixed_pars] > upper_bounds[unfixed_pars]
+            )
+           ){
+            ## Calculate new likelihood and find difference to old likelihood
+            posterior.out <- posterior_simp(proposal)
+            if(is.atomic(posterior.out)){
+              new_probab <- posterior.out
+              new_misc <- numeric()
+            } else {
+              new_probab <- posterior.out$lik
+              new_misc <- posterior.out$misc
+            }
+
+            log_prob <- min(new_probab-probab,0)
+
+            ## Accept with probability 1 if better, or proportional to
+            ## difference if not
+            if(is.finite(log_prob) && log(runif(1)) < log_prob){
+                current_pars <- proposal
+                probab <- new_probab
+                misc <- new_misc
+
+                ## Store acceptances
+                if(is.null(mvrPars)){
+                    tempaccepted[j] <- tempaccepted[j] + 1
+                } else {
+                    tempaccepted <- tempaccepted + 1
+                }
+            }
+        }
+
+
+        ## If current iteration matches with recording frequency, store in the chain. If we are at the limit of the save block,
+        ## save this block of chain to file and reset chain
+        if(i %% thin ==0){
+            save_chain[no_recorded,1] <- sampno
+            save_chain[no_recorded,2:(ncol(save_chain)-1-misc_length)] <- current_pars
+            if(misc_length > 0){
+              save_chain[no_recorded,(ncol(save_chain)-1-misc_length+1):(ncol(save_chain)-1)] <- unname(misc)
+            }
+            save_chain[no_recorded,ncol(save_chain)] <- probab
+            no_recorded <- no_recorded + 1
+        }
+
+
+
+        ## If within adaptive period, need to do some adapting!
+        if(i <= adaptive_period){
+            ## Current acceptance rate
+            pcur <- tempaccepted/tempiter
+            ## Save each step
+            opt_chain[chain_index,] <- current_pars[unfixed_pars]
+
+            ## If in an adaptive step
+            if(chain_index %% opt_freq == 0){
+                ## If using univariate proposals
+                if(is.null(mvrPars)){
+                    ## For each non fixed parameter, scale the step size
+                    for(x in unfixed_pars) steps[x] <- scaletuning(steps[x],popt,pcur[x])
+                    message(cat("Pcur: ", pcur[unfixed_pars],sep="\t"))
+                    message(cat("Step sizes: ", steps[unfixed_pars],sep="\t"))
+                    tempaccepted <- tempiter <- reset
+
+                } else {       ## If using multivariate proposals
+                    if(chain_index > OPT_TUNING*adaptive_period & chain_index < (scale_freq*adaptive_period)){
+                        oldCovMat <- covMat
+                        ## Creates a new covariance matrix, but weights it with the old one
+                        covMat <- cov(opt_chain[1:chain_index,])
+                        covMat <- w*covMat + (1-w)*oldCovMat
+                    }
+                    ## Scale tuning for last 1-scale_freq % of the adpative period
+                    if(chain_index > (scale_freq)*adaptive_period){
+                        scale <- scaletuning(scale, popt,pcur)
+                    }
+                    tempiter <- tempaccepted <- 0
+
+                    message(cat("Pcur: ", pcur,sep="\t"))
+                    message(cat("Scale: ", scale,sep="\t"))
+                }
+            }
+            chain_index <- chain_index + 1
+        }
+        if(i %% save_block == 0){
+            message(cat("Current iteration: ", i, sep="\t"))
+            ## Print out optimisation frequencies
+        }
+
+        if(no_recorded == save_block){
+            write.table(save_chain[1:(no_recorded-1),],file=mcmc_chain_file,col.names=FALSE,row.names=FALSE,sep=",",append=TRUE)
+            save_chain <- empty_save_chain
+            no_recorded <- 1
+        }
+        sampno <- sampno + 1
+    }
+
+    ## If there are some recorded values left that haven't been saved, then append these to the MCMC chain file. Note
+    ## that due to the use of cbind, we have to check to make sure that (no_recorded-1) would not result in a single value
+    ## rather than an array
+    if(no_recorded > 2){
+        write.table(save_chain[1:(no_recorded-1),],file=mcmc_chain_file,row.names=FALSE,col.names=FALSE,sep=",",append=TRUE)
+    }
+
+    if(is.null(mvrPars)){
+        covMat <- NULL
+        scale <- NULL
+    } else {
+        steps <- NULL
+    }
+    return(list("file"=mcmc_chain_file,"covMat"=covMat,"scale"=scale, "steps"=steps))
+}
+```
+
+
+```{r}
+dir.create("mcmc_chains/crx_multiple_cross_section",recursive=TRUE)
+##################################
+## RUN THE MCMC FRAMEWORK
+## Run 3 MCMC chains. Note that it is possible to parallelize this loop with foreach and doPar
+## Note the `use_pos` argument needs to be set here too
+nchains <- 3
+res <- foreach(chain_no=1:nchains,.packages = c("virosolver","lazymcmc","extraDistr","tidyverse","patchwork")) %dopar% {
+  ## Get random starting values
+  start_tab <- generate_viable_start_pars(par_tab,ct_used,
+                                         create_posterior_func,
+                                         incidence_function,
+                                         prior_func_gp)
+  
+  output <- run_MCMC(parTab=start_tab,
+                     data=ct_used,
+                     INCIDENCE_FUNC=incidence_function,
+                     PRIOR_FUNC=prior_func_gp,
+                     mcmcPars=mcmc_pars,
+                     filename=paste0("mcmc_chains/crx_multiple_cross_section/readme_gp_",chain_no),
+                     CREATE_POSTERIOR_FUNC=create_posterior_func,
+                     mvrPars=NULL,
+                     OPT_TUNING=0.2,
+                     use_pos=FALSE,
+                     t_dist=t_dist)
+}
+```
+
+The remaining steps are the same as the single cross section example. We read in the MCMC chains, check for convergence, and then use the posterior draws to check our estimates.
+
+```{r}
+## Read in the MCMC chains
+chains <- load_mcmc_chains(location="mcmc_chains/crx_multiple_cross_section",
+                           parTab=par_tab,
+                           burnin=mcmc_pars["adaptive_period"],
+                           chainNo=TRUE,
+                           unfixed=TRUE,
+                           multi=FALSE)
+
+chains_melted <- chains$chain %>% as_tibble %>% group_by(chain) %>% mutate(sampno=1:n()) %>% pivot_longer(-c(sampno,chain))
+## Look at trace plots
+p_trace_gp <- chains_melted %>%
+  filter(!(name %in% paste0("prob.",1:max(times)))) %>%
+  ggplot() + 
+  geom_line(aes(x=sampno,y=value,col=as.factor(chain))) + 
+  facet_wrap(~name,scales="free_y") + 
+  scale_color_viridis_d(name="Chain") + 
+  theme_bw() +
+  xlab("Iteration") +
+  ylab("Value")
+p_trace_gp
+```
+
+Plot predicted incidence curves using posterior draws and compare to the true incidence curve (blue).
+
+```{r}
+get_index_pars = function (chain, index) 
+{
+    tmp_names <- colnames(chain)[2:(ncol(chain) - 1)]
+    parsL <- chain[chain$sampno == index, 2:(ncol(chain) - 
+        1)]
+    #pars <- as.matrix(parsL)
+    #names(pars) <- tmp_names
+    return(pars)
+}
+
+INCIDENCE_FUNC = function (pars, times) 
+{
+    par_names <- names(pars)
+    use_names <- c("prob", paste0("prob.", 1:length(times)))
+    overall_prob <- pars["overall_prob"]
+    k <- pars[which(par_names %in% use_names)]
+    mat <- matrix(rep(times, each = length(times)), ncol = length(times))
+    t_dist <- abs(apply(mat, 2, function(x) x - times))
+    nu <- pars["nu"]
+    rho <- pars["rho"]
+    nu = as.matrix(nu)
+    rho = as.matrix(rho)
+    K <- nu^2 * exp(-rho^2 * t_dist^2)
+    K = as.matrix(K)
+    diag(K) <- diag(K) + 0.01
+    L_K <- t(chol(K))
+    k1 <- (L_K %*% k)[, 1]
+    ps <- 1/(1 + exp(-k1))
+    ps <- ps/sum(ps)
+    prob_infection_tmp <- ps * overall_prob
+    prob_infection_tmp
+}
+```
+
+
+```{r}
+function (chain, nsamps, INCIDENCE_FUNC, solve_times, obs_dat = NULL, 
+    true_prob_infection = NULL, tshift = 0, smooth = FALSE) 
+{
+    samps <- sample(unique(chain$sampno), nsamps)
+    all_res <- NULL
+    for (i in seq_along(samps)) {
+        samp <- samps[i]
+        tmp_pars <- get_index_pars(chain, samp)
+        prob_infection_tmp <- INCIDENCE_FUNC(pars = tmp_pars, times = solve_times)
+        if (smooth) {
+            prob_infection_tmp <- pmax(smooth.spline(prob_infection_tmp, 
+                spar = 0.3)$y, 1e-07)
+        }
+        all_res[[i]] <- tibble(t = solve_times + tshift, prob_infection = prob_infection_tmp, 
+            sampno = i)
+    }
+    posterior_dat <- do.call("bind_rows", all_res)
+    best_pars <- lazymcmc::get_best_pars(chain)
+    best_prob_infection <- INCIDENCE_FUNC(best_pars, solve_times)
+    if (smooth) {
+        best_prob_infection <- pmax(smooth.spline(best_prob_infection)$y, 
+            1e-07)
+    }
+    best_prob_dat <- tibble(t = solve_times + tshift, prob_infection = best_prob_infection, 
+        sampno = "MAP")
+    p1 <- ggplot(posterior_dat) + geom_line(aes(x = t, y = prob_infection, 
+        group = sampno, col = "Posterior draw"), size = 0.1) + 
+        geom_line(data = best_prob_dat, aes(x = t, y = prob_infection, 
+            col = "MAP"), size = 0.5) + scale_y_continuous(expand = c(0, 
+        0)) + xlab("Time") + ylab("Probability of infection") + 
+        theme_classic()
+    if (!is.null(true_prob_infection)) {
+        p1 <- p1 + geom_line(data = true_prob_infection, aes(x = t, 
+            y = prob_infection, col = "Ground truth"), 
+            linetype = "dashed", size = 0.5)
+    }
+    if (!is.null(obs_dat)) {
+        p1 <- p1 + geom_vline(data = data.frame(x = unique(obs_dat$t)), 
+            aes(xintercept = x, linetype = "Sample date"), 
+            col = "red", size = 0.25)
+    }
+    p1 <- p1 + scale_color_manual(values = c(`Posterior draw` = "gray50", 
+        MAP = "green", `Ground truth` = "blue")) + 
+        scale_linetype_manual(values = c(`Sample date` = "dashed")) + 
+        guides(col = guide_legend(title = NULL), linetype = guide_legend(title = NULL)) + 
+        theme(legend.position = "bottom")
+    return(list(predictions = posterior_dat, map_prediction = best_prob_dat, 
+        plot = p1))
+}
+```
+
+
+```{r}
+## Load in MCMC chains again, but this time read in the fixed parameters too 
+## to ensure that the posterior draws are compatible with the model functions
+chains <- load_mcmc_chains(location="mcmc_chains/readme_multiple_cross_section/",
+                           parTab=par_tab,
+                           burnin=mcmc_pars["adaptive_period"],
+                           chainNo=FALSE,
+                           unfixed=FALSE,
+                           multi=FALSE)
+## [1] "mcmc_chains/readme_multiple_cross_section//readme_gp_1_univariate_chain.csv"
+## [2] "mcmc_chains/readme_multiple_cross_section//readme_gp_2_univariate_chain.csv"
+## [3] "mcmc_chains/readme_multiple_cross_section//readme_gp_3_univariate_chain.csv"
+## [[1]]
+## [1] 201
+## 
+## [[2]]
+## [1] 201
+## 
+## [[3]]
+## [1] 201
+## Do some reshaping to allow correct subsampling (we need each sampno to correspond to one unique posterior draw)
+chain_comb <- as.data.frame(chains$chain)
+chain_comb$sampno <- 1:nrow(chain_comb)
+
+## Load in true incidence curve to compare to our prediction
+data(example_seir_incidence)
+predictions <- plot_prob_infection(chain_comb,nsamps=100, INCIDENCE_FUNC=incidence_function,
+                                  solve_times=0:max(ct_used$t),obs_dat=ct_used,
+                                  #true_prob_infection=example_seir_incidence,
+                                  smooth=TRUE) ## Smooth the trajectories a bit
+p_incidence_prediction <- predictions$plot + scale_x_continuous(limits=c(0,200))
+p_incidence_prediction
+```
+
